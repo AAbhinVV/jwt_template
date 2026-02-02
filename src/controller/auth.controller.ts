@@ -1,54 +1,66 @@
-import { registerSchema, loginSchema } from "../config/zod";
+import { registerSchema, loginSchema } from "../config/zod.js";
 import bcrypt from "bcrypt";
-import prisma from "../config/prisma";
-import generateTokenAndSetCookie, { verifyRefreshToken } from "../util/generateTokenAndSetCookie.js";
+import prisma from "../config/prisma.js";
+import {generateTokenAndSetCookie, verifyRefreshToken } from "../util/generateTokenAndSetCookie.js";
 import { redisClient } from "../config/redis.js";
 import { loginUser, registerUser } from "../service/auth.service.js";
 import { register } from "node:module";
+import type { Request, Response } from "express";
 
-const login = async (req, res) => {
+type ValidationErrors = 
+    { field: string; message: string; code: string };
+
+const login = async (req : Request, res : Response) : Promise<void>  => {
   try {
-    const validation = loginSchema.parse(req.body);
+    const validation = loginSchema.safeParse(req.body);
 
     if(!validation.success) {
-        const zodErrors = validation.error;
+        const zodErrors = validation.error.errors;
 
         let firstErrorMessage = "Validation error";
-        let allErrors = [];
+        let allErrors: ValidationErrors[] = [];
+        
 
-        if(zodErrors?.errors && Array.isArray(zodErrors.errors)) {
-            allErrors = zodErrors.errors.map((issue) => ({
+        if(Array.isArray(zodErrors)) {
+            allErrors = zodErrors.map((issue) => ({
                 field: issue.path ? issue.path.join('.') : 'unknown',
                 message: issue.message || "validation error",
                 code: issue.code
             }))
         
-            firstErrorMessage = allErrors[0].message || "validation Error";
+            firstErrorMessage = allErrors[0]?.message ?? "validation Error";
         }
-        return res.status(422).json({success: false, message: firstErrorMessage})
+        res.status(422).json({success: false, message: firstErrorMessage})
+        return;
     }
 
     const {email, password} = validation.data;
 
     if(!email || !password) {
-        return res.status(400).json({success: false, message: "All field are required"});
+        res.status(400).json({success: false, message: "All field are required"});
+        return;
     }
 
-    const result = loginUser({email, password, ip: req.ip});
+    const result = await loginUser({email, password, ip: req.ip});
 
-    if(result.error === "RATE_LIMIT_EXCEEDED"){
-        return res.status(429).json({success: false, message: result.message})
+    if("error" in result){
+        if(result.error === "RATE_LIMIT_EXCEEDED"){
+        res.status(429).json({success: false, message: result.message})
+        return;
 
+        }
+
+        if(result.error === "INVALID_CREDENTIALS"){
+            res.status(401).json({success:false, message: result.message})
+            return;
+        }
     }
 
-    if(result.error === "INVALID_CREDENTIALS"){
-        return res.status(401).json({success:false, message: result.message})
-    }
-
-    const {accessToken, refreshToken} = generateTokenAndSetCookie(res, user.id);
+    const {accessToken, refreshToken} = generateTokenAndSetCookie(res, result.userId);
 
     if(!accessToken || !refreshToken) {
-        return res.status(500).json({success: false, message: "Token generation failed"});
+        res.status(500).json({success: false, message: "Token generation failed"});
+        return;
     }
 
     res.status(200).json({
@@ -58,15 +70,17 @@ const login = async (req, res) => {
     });
 
 
-  } catch (error) {
-    console.log(error.message);
+  } catch (error: unknown) {
+    if(error instanceof Error){
+        console.error(error.message);
+    }
     res.sendStatus(503);
   }
 }
 
-const signUp = async (req, res) => {
+const signUp = async (req: Request, res: Response) : Promise<void> => {
     try {
-        const validation = registerSchema.safeParse(req.body)
+        const validation : ReturnType<typeof registerSchema.safeParse> = registerSchema.safeParse(req.body)
 
         if(!validation.success){
             const zodErrors = validation.error;
@@ -83,31 +97,36 @@ const signUp = async (req, res) => {
                 firstErrorMessage = allErrors[0].message || "validation error";
             }
 
-            return res.status(422).json({success: false, message: firstErrorMessage});
+            res.status(422).json({success: false, message: firstErrorMessage});
+            return;
         }
 
         const { fullName, lastName, email, password} = validation.data;
 
 
         if(!fullName || !lastName || !email || !password) {
-            return res.status(400).json({success: false, message: 'All fields are required'});
+            res.status(400).json({success: false, message: 'All fields are required'});
+            return;
         }
 
         
         const result = registerUser({fullName, lastName, email, password, ip: req.ip});
 
         if(result.error === "RATE_LIMIT_EXCEEDED"){
-            return res.status(429).json({success: false, message: result.message});
+            res.status(429).json({success: false, message: result.message});
+            return;
         }
 
         if(result.error === "EMAIL_ALREADY_REGISTERED"){
-            return res.status(409).json({success: false, message: result.message});
+            res.status(409).json({success: false, message: result.message});
+            return;
         }
 
         const {accessToken, refreshToken} = generateTokenAndSetCookie(res, result.userId);
 
         if(!accessToken || !refreshToken) {
-            return res.status(500).json({success: false, message: "Token generation failed"});
+            res.status(500).json({success: false, message: "Token generation failed"});
+            return;
         }
 
         res.status(200).json({
@@ -143,13 +162,15 @@ const refreshToken = (req, res) => {
   const refreshTokne = req.signedCookies?.refreshToken || req.signedCookies?.refreshToken;
 
   if(!refreshToken){
-    return res.status(401).json({success: false, message: "No refresh token provided"});
+    res.status(401).json({success: false, message: "No refresh token provided"});
+    return;
   }
 
   const decoded = verifyRefreshToken(refreshToken);
 
   if(!decoded){
-    return res.status(403).json({success: false, message: "Forbidden: Invalid refresh token"});
+    res.status(403).json({success: false, message: "Forbidden: Invalid refresh token"});
+    return;
   }
 
   generateAccessToken(decoded.user.id);
@@ -157,7 +178,8 @@ const refreshToken = (req, res) => {
   jwt.verify(refreshToken, JWT_REFRESH_SECRET, 
     async (err, user) => {
         if(err) {
-            return res.status(403).json({success: false, message: "Forbidden: Invalid refresh token"});
+            res.status(403).json({success: false, message: "Forbidden: Invalid refresh token"});
+            return;
         }
 
         const founduser = await prisma.user.findUnique({
@@ -165,8 +187,8 @@ const refreshToken = (req, res) => {
         })
 
         if(!founduser){
-            return res.status(403).json({success: false, message: "Forbidden: User not found"});
-    
+            res.status(403).json({success: false, message: "Forbidden: User not found"});
+            return;
         }
 
         const accessToken = jwt.sign({userId: founduser.id}, JWT_ACCESS_SECRET, {expiresIn: ACCESS_TOKEN_EXPIRY});
